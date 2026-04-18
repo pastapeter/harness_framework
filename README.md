@@ -2,3 +2,5 @@
 - https://raspy-roll-970.notion.site/340f7725c9d98176b68bd31c823c7540#649595cce9514afc8d9fc8b8339a67fb
 - Harness Engineering Guide
 - https://raspy-roll-970.notion.site/AI-333f7725c9d98147957afad16db3b655
+- Claude code Guide (Skills, Hooks, Sub-Agents)
+- https://raspy-roll-970.notion.site/Claude-Code-326f7725c9d981b89dc4c1262c0868c9#61802e1c314e40e6b68a6a40c78b7ecb
