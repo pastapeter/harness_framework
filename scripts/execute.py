@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -57,8 +58,10 @@ class StepExecutor:
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TZ = timezone(timedelta(hours=9))
+    SUPPORTED_AGENTS = ("codex", "claude")
+    AGENT_DOC_CANDIDATES = ("AGENT.md", "CLAUDE.md", "CODEX.md")
 
-    def __init__(self, phase_dir_name: str, *, auto_push: bool = False):
+    def __init__(self, phase_dir_name: str, *, auto_push: bool = False, agent: Optional[str] = None):
         self._root = str(ROOT)
         self._phases_dir = ROOT / "phases"
         self._phase_dir = self._phases_dir / phase_dir_name
@@ -79,6 +82,7 @@ class StepExecutor:
         self._project = idx.get("project", "project")
         self._phase_name = idx.get("phase", phase_dir_name)
         self._total = len(idx["steps"])
+        self._agent = self._resolve_agent(agent)
 
     def run(self):
         self._print_header()
@@ -109,6 +113,53 @@ class StepExecutor:
     def _run_git(self, *args) -> subprocess.CompletedProcess:
         cmd = ["git"] + list(args)
         return subprocess.run(cmd, cwd=self._root, capture_output=True, text=True)
+
+    @classmethod
+    def _detect_available_agent(cls) -> Optional[str]:
+        for candidate in cls.SUPPORTED_AGENTS:
+            if shutil.which(candidate):
+                return candidate
+        return None
+
+    @classmethod
+    def _resolve_agent(cls, explicit_agent: Optional[str] = None) -> str:
+        candidate = explicit_agent or os.environ.get("HARNESS_AGENT")
+        if candidate:
+            candidate = candidate.lower()
+            if candidate not in cls.SUPPORTED_AGENTS:
+                print(f"ERROR: unsupported agent '{candidate}'. Choose one of: {', '.join(cls.SUPPORTED_AGENTS)}")
+                sys.exit(1)
+            if shutil.which(candidate) is None:
+                print(f"ERROR: requested agent '{candidate}' is not installed or not in PATH.")
+                sys.exit(1)
+            return candidate
+
+        detected = cls._detect_available_agent()
+        if detected:
+            return detected
+
+        print("ERROR: no supported agent CLI found in PATH. Install one of: codex, claude")
+        sys.exit(1)
+
+    def _build_agent_command(self, prompt: str) -> list[str]:
+        if self._agent == "codex":
+            return [
+                "codex",
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                self._root,
+                prompt,
+            ]
+
+        return [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "json",
+            prompt,
+        ]
 
     def _checkout_branch(self):
         branch = f"feat-{self._phase_name}"
@@ -176,9 +227,11 @@ class StepExecutor:
 
     def _load_guardrails(self) -> str:
         sections = []
-        claude_md = ROOT / "CLAUDE.md"
-        if claude_md.exists():
-            sections.append(f"## 프로젝트 규칙 (CLAUDE.md)\n\n{claude_md.read_text()}")
+        for doc_name in self.AGENT_DOC_CANDIDATES:
+            agent_doc = ROOT / doc_name
+            if agent_doc.exists():
+                sections.append(f"## 프로젝트 규칙 ({doc_name})\n\n{agent_doc.read_text()}")
+                break
         docs_dir = ROOT / "docs"
         if docs_dir.is_dir():
             for doc in sorted(docs_dir.glob("*.md")):
@@ -224,9 +277,9 @@ class StepExecutor:
             f"   {commit_example}\n\n---\n\n"
         )
 
-    # --- Claude 호출 ---
+    # --- 에이전트 호출 ---
 
-    def _invoke_claude(self, step: dict, preamble: str) -> dict:
+    def _invoke_agent(self, step: dict, preamble: str) -> dict:
         step_num, step_name = step["step"], step["name"]
         step_file = self._phase_dir / f"step{step_num}.md"
 
@@ -236,12 +289,12 @@ class StepExecutor:
 
         prompt = preamble + step_file.read_text()
         result = subprocess.run(
-            ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
+            self._build_agent_command(prompt),
             cwd=self._root, capture_output=True, text=True, timeout=1800,
         )
 
         if result.returncode != 0:
-            print(f"\n  WARN: Claude가 비정상 종료됨 (code {result.returncode})")
+            print(f"\n  WARN: {self._agent}가 비정상 종료됨 (code {result.returncode})")
             if result.stderr:
                 print(f"  stderr: {result.stderr[:500]}")
 
@@ -262,6 +315,7 @@ class StepExecutor:
         print(f"\n{'='*60}")
         print(f"  Harness Step Executor")
         print(f"  Phase: {self._phase_name} | Steps: {self._total}")
+        print(f"  Agent: {self._agent}")
         if self._auto_push:
             print(f"  Auto-push: enabled")
         print(f"{'='*60}")
@@ -306,8 +360,9 @@ class StepExecutor:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
 
             with progress_indicator(tag) as pi:
-                self._invoke_claude(step, preamble)
-                elapsed = int(pi.elapsed)
+                self._invoke_agent(step, preamble)
+
+            elapsed = int(pi.elapsed)
 
             index = self._read_json(self._index_file)
             status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
@@ -408,9 +463,10 @@ def main():
     parser = argparse.ArgumentParser(description="Harness Step Executor")
     parser.add_argument("phase_dir", help="Phase directory name (e.g. 0-mvp)")
     parser.add_argument("--push", action="store_true", help="Push branch after completion")
+    parser.add_argument("--agent", choices=StepExecutor.SUPPORTED_AGENTS, help="Agent CLI to use")
     args = parser.parse_args()
 
-    StepExecutor(args.phase_dir, auto_push=args.push).run()
+    StepExecutor(args.phase_dir, auto_push=args.push, agent=args.agent).run()
 
 
 if __name__ == "__main__":

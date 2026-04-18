@@ -77,7 +77,7 @@ def top_index(tmp_project):
 @pytest.fixture
 def executor(tmp_project, phase_dir):
     """테스트용 StepExecutor 인스턴스. git 호출은 별도 mock 필요."""
-    with patch.object(ex, "ROOT", tmp_project):
+    with patch.object(ex, "ROOT", tmp_project), patch.object(ex.StepExecutor, "_resolve_agent", return_value="claude"):
         inst = ex.StepExecutor("0-mvp")
     # 내부 경로를 tmp_project 기준으로 재설정
     inst._root = str(tmp_project)
@@ -87,6 +87,58 @@ def executor(tmp_project, phase_dir):
     inst._index_file = phase_dir / "index.json"
     inst._top_index_file = tmp_project / "phases" / "index.json"
     return inst
+
+
+# ---------------------------------------------------------------------------
+# _resolve_agent / _build_agent_command
+# ---------------------------------------------------------------------------
+
+class TestAgentSelection:
+    def test_explicit_agent_wins(self):
+        with patch("shutil.which", return_value="/usr/bin/codex"):
+            assert ex.StepExecutor._resolve_agent("codex") == "codex"
+
+    def test_env_agent_used_when_explicit_missing(self):
+        with patch.dict(os.environ, {"HARNESS_AGENT": "claude"}, clear=False):
+            with patch("shutil.which", return_value="/usr/bin/claude"):
+                assert ex.StepExecutor._resolve_agent() == "claude"
+
+    def test_invalid_agent_exits(self):
+        with pytest.raises(SystemExit) as exc_info:
+            ex.StepExecutor._resolve_agent("nope")
+        assert exc_info.value.code == 1
+
+    def test_missing_requested_agent_exits(self):
+        with patch("shutil.which", return_value=None):
+            with pytest.raises(SystemExit) as exc_info:
+                ex.StepExecutor._resolve_agent("codex")
+        assert exc_info.value.code == 1
+
+    def test_autodetect_prefers_codex(self):
+        def fake_which(name):
+            return f"/usr/bin/{name}" if name in {"codex", "claude"} else None
+
+        with patch("shutil.which", side_effect=fake_which):
+            assert ex.StepExecutor._resolve_agent() == "codex"
+
+
+class TestBuildAgentCommand:
+    def test_builds_claude_command(self, executor):
+        executor._agent = "claude"
+        cmd = executor._build_agent_command("PROMPT")
+        assert cmd[0] == "claude"
+        assert "-p" in cmd
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--output-format" in cmd
+        assert cmd[-1] == "PROMPT"
+
+    def test_builds_codex_command(self, executor):
+        executor._agent = "codex"
+        cmd = executor._build_agent_command("PROMPT")
+        assert cmd[:2] == ["codex", "exec"]
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        assert "-C" in cmd
+        assert cmd[-1] == "PROMPT"
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +198,7 @@ class TestJsonHelpers:
 # ---------------------------------------------------------------------------
 
 class TestLoadGuardrails:
-    def test_loads_claude_md_and_docs(self, executor, tmp_project):
+    def test_loads_agent_doc_and_docs(self, executor, tmp_project):
         with patch.object(ex, "ROOT", tmp_project):
             result = executor._load_guardrails()
         assert "# Rules" in result
@@ -166,12 +218,20 @@ class TestLoadGuardrails:
         guide_pos = result.index("guide")
         assert arch_pos < guide_pos
 
-    def test_no_claude_md(self, executor, tmp_project):
+    def test_no_agent_doc(self, executor, tmp_project):
         (tmp_project / "CLAUDE.md").unlink()
         with patch.object(ex, "ROOT", tmp_project):
             result = executor._load_guardrails()
         assert "CLAUDE.md" not in result
         assert "Architecture" in result
+
+    def test_prefers_agent_md_over_legacy_files(self, executor, tmp_project):
+        (tmp_project / "AGENT.md").write_text("# Agent Rules\n- use codex")
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails()
+        assert "AGENT.md" in result
+        assert "Agent Rules" in result
+        assert "CLAUDE.md" not in result
 
     def test_no_docs_dir(self, executor, tmp_project):
         import shutil
@@ -420,17 +480,17 @@ class TestCommitStep:
 
 
 # ---------------------------------------------------------------------------
-# _invoke_claude (mocked)
+# _invoke_agent (mocked)
 # ---------------------------------------------------------------------------
 
-class TestInvokeClaude:
+class TestInvokeAgent:
     def test_invokes_claude_with_correct_args(self, executor):
         mock_result = MagicMock(returncode=0, stdout='{"result": "ok"}', stderr="")
         step = {"step": 2, "name": "ui"}
         preamble = "PREAMBLE\n"
 
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            output = executor._invoke_claude(step, preamble)
+            output = executor._invoke_agent(step, preamble)
 
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == "claude"
@@ -445,7 +505,7 @@ class TestInvokeClaude:
         step = {"step": 2, "name": "ui"}
 
         with patch("subprocess.run", return_value=mock_result):
-            executor._invoke_claude(step, "preamble")
+            executor._invoke_agent(step, "preamble")
 
         output_file = executor._phase_dir / "step2-output.json"
         assert output_file.exists()
@@ -457,7 +517,7 @@ class TestInvokeClaude:
     def test_nonexistent_step_file_exits(self, executor):
         step = {"step": 99, "name": "nonexistent"}
         with pytest.raises(SystemExit) as exc_info:
-            executor._invoke_claude(step, "preamble")
+            executor._invoke_agent(step, "preamble")
         assert exc_info.value.code == 1
 
     def test_timeout_is_1800(self, executor):
@@ -465,9 +525,22 @@ class TestInvokeClaude:
         step = {"step": 2, "name": "ui"}
 
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            executor._invoke_claude(step, "preamble")
+            executor._invoke_agent(step, "preamble")
 
         assert mock_run.call_args[1]["timeout"] == 1800
+
+    def test_invokes_codex_with_correct_args(self, executor):
+        executor._agent = "codex"
+        mock_result = MagicMock(returncode=0, stdout="done", stderr="")
+        step = {"step": 2, "name": "ui"}
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            executor._invoke_agent(step, "PREAMBLE\n")
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[:2] == ["codex", "exec"]
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        assert "-C" in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +574,7 @@ class TestMainCli:
 
     def test_invalid_phase_dir_exits(self):
         with patch("sys.argv", ["execute.py", "nonexistent"]):
-            with patch.object(ex, "ROOT", Path("/tmp/fake_nonexistent")):
+            with patch.object(ex, "ROOT", Path("/tmp/fake_nonexistent")), patch.object(ex.StepExecutor, "_resolve_agent", return_value="claude"):
                 with pytest.raises(SystemExit) as exc_info:
                     ex.main()
                 assert exc_info.value.code == 1
@@ -509,7 +582,7 @@ class TestMainCli:
     def test_missing_index_exits(self, tmp_project):
         (tmp_project / "phases" / "empty").mkdir()
         with patch("sys.argv", ["execute.py", "empty"]):
-            with patch.object(ex, "ROOT", tmp_project):
+            with patch.object(ex, "ROOT", tmp_project), patch.object(ex.StepExecutor, "_resolve_agent", return_value="claude"):
                 with pytest.raises(SystemExit) as exc_info:
                     ex.main()
                 assert exc_info.value.code == 1
